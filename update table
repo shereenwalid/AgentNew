@@ -1,0 +1,46 @@
+from google.cloud import bigquery
+
+BILLING_PROJECT = "vf-ie-aib-prd-cfa-lab"   # project used for running/billing the job
+DATA_PROJECT = "vf-ie-datahub"              # project where the actual data lives
+DATASET = "vfie_dh_lake_customer_complex_fixed_s"
+
+client = bigquery.Client(project=BILLING_PROJECT)
+
+dataset_ref = bigquery.DatasetReference(DATA_PROJECT, DATASET)
+
+# default_dataset lets you reference tables without prefixing project/dataset
+job_config = bigquery.QueryJobConfig(default_dataset=dataset_ref)
+
+# 1. Get all tables starting with TEMP_
+tables = client.list_tables(dataset_ref)
+temp_tables = [t.table_id for t in tables if t.table_id.startswith("TEMP_")]
+
+print(f"Found {len(temp_tables)} TEMP_ tables")
+
+for table_name in temp_tables:
+    table_ref = dataset_ref.table(table_name)
+    table = client.get_table(table_ref)
+
+    select_cols = []
+    for field in table.schema:
+        original_col = field.name
+        clean_col = original_col.strip()
+        select_cols.append(f"`{original_col}` AS `{clean_col}`")
+
+    select_clause = ",\n    ".join(select_cols)
+
+    new_table_name = "raw_" + table_name[len("TEMP_"):]
+
+    query = f"""
+    CREATE OR REPLACE TABLE `{new_table_name}` AS
+    SELECT
+    {select_clause}
+    FROM `{table_name}`
+    """
+
+    print(f"Creating {new_table_name} from {table_name} ...")
+    job = client.query(query, job_config=job_config)
+    job.result()
+    print(f"Done: {new_table_name}")
+
+print("All tables processed.")
