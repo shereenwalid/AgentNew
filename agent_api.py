@@ -39,6 +39,24 @@ def _is_rai_error(exc: Exception) -> bool:
     return any(p in msg for p in _RAI_PATTERNS)
 
 
+_SIZE_PATTERNS = (
+    "constraint is too tall", "constraint-is-too-big", "invalid_argument",
+    "request contains an invalid argument", "too large", "exceeds",
+)
+
+
+def _is_size_error(exc: Exception) -> bool:
+    msg = str(exc).lower()
+    return any(p in msg for p in _SIZE_PATTERNS)
+
+
+# How many times to shrink the condense budget and re-run on a size error,
+# and the shrink factor each time.
+SIZE_MAX_RETRIES = int(os.getenv("SIZE_MAX_RETRIES", "4"))
+SIZE_SHRINK_FACTOR = float(os.getenv("SIZE_SHRINK_FACTOR", "0.5"))
+SIZE_MIN_BUDGET = int(os.getenv("SIZE_MIN_BUDGET", "12000"))
+
+
 async def _say_hi():
     """Benign warm-up turn straight to the model (not through the workflow)."""
     try:
@@ -204,20 +222,55 @@ def _shape_result(opp_id, validation, order):
     """Convert agent output into the UI shape."""
     v = _parse_json_block(validation) or {}
     o = _parse_json_block(order) or {}
+    # The extractor no longer uses a constrained output_schema (it produced a
+    # decoding state machine too large for the serving layer). Validate/coerce
+    # the parsed JSON against BSPOrderTemplate here instead - best effort, so a
+    # minor deviation never blocks the result.
+    try:
+        from vf_quote_to_order_agent_configured.Agent.models import BSPOrderTemplate  # type: ignore
+        if isinstance(o, dict):
+            o = BSPOrderTemplate(**o).model_dump()
+    except Exception:  # noqa: BLE001 - keep the raw parsed dict if coercion fails
+        pass
 
     def items(section, labels):
         out = []
         data = v.get(section, {}) or {}
+
+        # The agent now returns compact arrays to save tokens:
+        #   ["C1", "Y|N", "reason", "action?"]  (action only for B*/X*)
+        # It maps by the SHORT id (C1) or the full key (C1_leadtime_...).
+        # We still support the legacy object format for safety.
+        short_index = {}   # short id -> (result, notes, action)
+        if isinstance(data, list):
+            for row in data:
+                if not row:
+                    continue
+                key = str(row[0]).strip()
+                res = str(row[1]).strip().upper() if len(row) > 1 else "N"
+                note = row[2] if len(row) > 2 else ""
+                action = row[3] if len(row) > 3 else "none"
+                short_index[key.upper()] = (res, note, action)
+
         for key, label in labels.items():
-            entry = data.get(key, {}) or {}
-            res = str(entry.get("result", "N")).strip().upper()
+            short = key.split("_", 1)[0].upper()   # "C1_leadtime..." -> "C1"
+            if short_index:
+                res_t, note, action = short_index.get(short, ("N", "", "none"))
+                res = str(res_t).strip().upper()
+                entry_feedback = None
+            else:
+                entry = data.get(key, {}) or {}
+                res = str(entry.get("result", "N")).strip().upper()
+                note = entry.get("notes", "")
+                action = entry.get("action", "none") or "none"
+                entry_feedback = entry.get("feedback")
             out.append({
                 "key": key,
                 "label": label,
                 "ok": res == "Y",
-                "notes": entry.get("notes", "") or ("Not verified" if res != "Y" else ""),
-                "action": entry.get("action", "none") or "none",
-                "feedback": entry.get("feedback"),
+                "notes": note or ("Not verified" if res != "Y" else ""),
+                "action": action or "none",
+                "feedback": entry_feedback,
             })
         return out
 
@@ -352,11 +405,23 @@ async def process(opp_id: str):
         else:
             attempt = 0
             overload_attempt = 0
+            size_attempt = 0
             while True:
                 try:
                     validation, order, gcs_prefix = await _run_agent(opp_id)
                     break
                 except Exception as exc:  # noqa: BLE001
+                    # Input too big for the model: shrink the condense budget and re-run.
+                    # get_opportunity_data reads CONDENSE_TOTAL_BUDGET live from env,
+                    # so lowering it here makes the next run send a smaller payload.
+                    if _is_size_error(exc) and size_attempt < SIZE_MAX_RETRIES:
+                        size_attempt += 1
+                        cur = int(os.getenv("CONDENSE_TOTAL_BUDGET", "120000"))
+                        new_budget = max(SIZE_MIN_BUDGET, int(cur * SIZE_SHRINK_FACTOR))
+                        os.environ["CONDENSE_TOTAL_BUDGET"] = str(new_budget)
+                        print(f"[size retry {size_attempt}/{SIZE_MAX_RETRIES}] input too big - "
+                              f"shrinking payload budget {cur} -> {new_budget} and re-running")
+                        continue
                     # Transient capacity/429: back off and retry (model queue overloaded)
                     if _is_overloaded_error(exc) and overload_attempt < OVERLOAD_MAX_RETRIES:
                         overload_attempt += 1
@@ -379,7 +444,12 @@ async def process(opp_id: str):
     except Exception as exc:  # noqa: BLE001
         traceback.print_exc()
         msg = str(exc)
-        if _is_overloaded_error(exc):
+        if _is_size_error(exc):
+            msg = ("The opportunity documents were too large for the model even after "
+                   "automatic compaction. Lower CONDENSE_TOTAL_BUDGET further, or the "
+                   "biggest file needs cleaning at source. "
+                   f"[{msg[:200]}]")
+        elif _is_overloaded_error(exc):
             msg = ("The model service is temporarily overloaded (429 / RESOURCE_EXHAUSTED). "
                    "This is a transient capacity issue - please try again in a moment. "
                    f"[{msg[:200]}]")
